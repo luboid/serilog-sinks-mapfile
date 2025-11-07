@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Serilog.Sinks.MapFile/Serilog.Sinks.MapFile.csproj" />
+  <Project Path="Serilog.Sinks.MapPattern/Serilog.Sinks.MapPattern.csproj" />
+  <Project Path="WorkerServiceSerilog/WorkerServiceSerilog.csproj" />
+</Solution>

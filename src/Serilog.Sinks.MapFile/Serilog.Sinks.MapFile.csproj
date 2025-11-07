@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net9</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<Version>1.0.0-beta01</Version>
+		<RootNamespace>Serilog.Sinks.MapFile</RootNamespace>
+		<RepositoryType>git</RepositoryType>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>embedded</DebugType>
+		<PackageReadmeFile>ReadMe.md</PackageReadmeFile>
+		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <Content Include="ReadMe.md">
+	    <PackagePath>\</PackagePath>
+	    <Pack>True</Pack>
+	  </Content>
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+		<ProjectReference Include="..\Serilog.Sinks.MapPattern\Serilog.Sinks.MapPattern.csproj" />
+	</ItemGroup>
+
+</Project>
