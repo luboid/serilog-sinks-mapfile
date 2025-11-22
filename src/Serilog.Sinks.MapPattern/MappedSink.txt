@@ -1,0 +1,253 @@
+﻿using Microsoft.Extensions.ObjectPool;
+using Serilog.Configuration;
+using Serilog.Core;
+using Serilog.Events;
+using System.Collections.Concurrent;
+
+namespace Serilog.Sinks.MapPattern;
+
+internal sealed class MappedSink : ILogEventSink, IDisposable
+{
+    private static readonly DefaultObjectPoolProvider _objectPoolProvider = new();
+    private readonly Action<string, LoggerSinkConfiguration> _configure;
+    private readonly int? _sinkMapCountLimit;
+    private readonly PatternTemplateTextFormatter _patternTemplate;
+    private readonly ConcurrentDictionary<MappedSinkEntry, Timer> _timers = [];
+    private readonly ConcurrentDictionary<int, List<MappedSinkEntry>> _sinks = [];
+    private readonly ObjectPool<StringWriter> _stringWriterPool;
+    private readonly Timer? _sinkCountLimitTimer;
+    private volatile bool _disposed;
+
+    public MappedSink(PatternTemplate patternTemplate, IFormatProvider? formatProvider, Action<string, LoggerSinkConfiguration> configure, int? sinkMapCountLimit = null)
+    {
+        _stringWriterPool = _objectPoolProvider.Create(new StringWriterPooledObjectPolicy());
+        _patternTemplate = new PatternTemplateTextFormatter(patternTemplate, formatProvider);
+        _configure = configure;
+        _sinkMapCountLimit = sinkMapCountLimit;
+        if (_sinkMapCountLimit > 0)
+        {
+            _sinkCountLimitTimer = new Timer(
+                CheckSinksLimit,
+                null,
+                1000,
+                10000); // start after 10 seconds
+        }
+    }
+
+    public void Emit(LogEvent logEvent)
+    {
+        ThrowIfDisposed();
+        GetPattern(logEvent, out string patternKey, out string pattern);
+        ILogEventSink sink = EnsureSink(patternKey, pattern);
+        try
+        {
+            sink?.Emit(logEvent);
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignore
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        _sinkCountLimitTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _sinkCountLimitTimer?.Dispose();
+
+        foreach (MappedSinkEntry entry in _sinks.Values.Select(t =>
+        {
+            lock (t)
+            {
+                return t.ToArray();
+            }
+        })
+        .SelectMany(t => t))
+        {
+            if (_timers.TryRemove(entry, out Timer? timer))
+            {
+                try
+                {
+                    timer.Change(Timeout.Infinite, Timeout.Infinite);
+                    timer.Dispose();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // timer is elapsed
+                    continue;
+                }
+            }
+
+            (entry.Sink as IDisposable)?.Dispose();
+        }
+
+        _sinks.Clear();
+        _timers.Clear();
+        (_stringWriterPool as IDisposable)?.Dispose();
+    }
+
+    private void CheckSinksLimit(object? obj)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_sinkMapCountLimit.HasValue && _sinks.Count > _sinkMapCountLimit.Value)
+        {
+            int count = _sinks.Count - _sinkMapCountLimit.Value;
+            foreach (MappedSinkEntry entry in _sinks.Values.Select(t =>
+            {
+                lock (t)
+                {
+                    return t.ToArray();
+                }
+            })
+            .SelectMany(t => t)
+            .OrderBy(i => i.Created))
+            {
+                if (_disposed)
+                {
+                    break;
+                }
+
+                --count;
+                DisposeSink(entry);
+                if (count <= 0)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    private ILogEventSink EnsureSink(string patternKey, string pattern)
+    {
+        ThrowIfDisposed();
+        int patternHash = pattern.GetHashCode();
+        int patternKeyHash = patternKey.GetHashCode();
+        List<MappedSinkEntry> list = _sinks.GetOrAdd(patternKeyHash, (_) => []);
+        lock (list)
+        {
+            int count = list.Count;
+            if (count == 0)
+            {
+                return CreateSink(list, patternKeyHash, patternHash, pattern);
+            }
+
+            // here we have one entry in most cases, in times of rollout of a new sink, there will be more than one
+            for (int i = 0; i < count; i++)
+            {
+                MappedSinkEntry entry = list[i];
+                if (entry.PatternHash == patternHash)
+                {
+                    return entry.Sink;
+                }
+                else if (i > 0)
+                {
+                    DisposeSink(entry);
+                }
+            }
+
+            DisposeSink(list[0]);
+
+            return CreateSink(list, patternKeyHash, patternHash, pattern);
+        }
+    }
+
+    private ILogEventSink CreateSink(List<MappedSinkEntry> list, int patternKeyHash, int patternHash, string pattern)
+    {
+        ThrowIfDisposed();
+        ILogEventSink sink = LoggerSinkConfiguration.CreateSink((wt) => _configure(pattern, wt));
+        list.Insert(0, new MappedSinkEntry(patternKeyHash, patternHash, sink, DateTime.UtcNow));
+        return sink;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException("MappedSink", "The mapped sink has been disposed.");
+        }
+    }
+
+    private void DisposeSink(MappedSinkEntry entry)
+    {
+        // dispose the old sink after 5 seconds to allow any in-flight writes to complete
+        Timer timer = _timers.GetOrAdd(entry, (entry) =>
+        {
+            return new(
+                (obj) =>
+                {
+                    MappedSinkEntry entry = (MappedSinkEntry)obj!;
+                    if (_timers.TryRemove(entry, out Timer? timer))
+                    {
+                        timer.Dispose();
+                    }
+
+                    if (_sinks.TryGetValue(entry.PatternKeyHash, out List<MappedSinkEntry>? list))
+                    {
+                        lock (list)
+                        {
+                            list.Remove(entry);
+                        }
+                    }
+
+                    (entry.Sink as IDisposable)?.Dispose();
+                },
+                entry,
+                Timeout.Infinite,
+                Timeout.Infinite);
+        });
+
+        try
+        {
+            // evry write postpone the disposal
+            timer.Change(5000, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+            // timer is elapsed, nothing to do
+        }
+    }
+
+    private void GetPattern(LogEvent logEvent, out string pathKey, out string path)
+    {
+        StringWriter pathWriter = _stringWriterPool.Get();
+        StringWriter pathKeyWriter = _stringWriterPool.Get();
+        try
+        {
+            _patternTemplate.Format(logEvent, pathKeyWriter, pathWriter);
+
+            pathKey = pathKeyWriter.ToString();
+            path = pathWriter.ToString();
+        }
+        finally
+        {
+            _stringWriterPool.Return(pathWriter);
+            _stringWriterPool.Return(pathKeyWriter);
+        }
+    }
+
+    private sealed class StringWriterPooledObjectPolicy : IPooledObjectPolicy<StringWriter>
+    {
+        public StringWriter Create()
+        {
+            return new StringWriter();
+        }
+
+        public bool Return(StringWriter obj)
+        {
+            obj.GetStringBuilder().Length = 0;
+            return true;
+        }
+    }
+
+    private sealed record MappedSinkEntry(int PatternKeyHash, int PatternHash, ILogEventSink Sink, DateTime Created);
+}
